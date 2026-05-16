@@ -1,0 +1,18 @@
+{
+  "C_Cpp.intelliSenseEngine": "default",
+  "idf.extensionActivationMode": "always",
+  "idf.openOcdConfigs": ["board/esp32c3-builtin.cfg"],
+  "idf.port": "/dev/tty.usbmodem1101",
+  "idf.currentSetup": "/Users/woodywillis/.espressif/v6.0.1/esp-idf",
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32c3",
+    "OPENOCD_USB_ADAPTER_LOCATION": "1-1"
+  },
+  "clangd.path": "/Users/woodywillis/.espressif/tools/esp-clang/esp-20.1.1_20250829/esp-clang/bin/clangd",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=/Users/woodywillis/Developer/fx-cg50-esp32-CIRWLib/build"
+  ],
+  "idf.flashType": "JTAG"
+}

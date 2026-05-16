@@ -1,0 +1,50 @@
+name: Build and Publish Release Binaries
+
+on:
+  release:
+    types: [created]
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          submodules: "recursive"
+
+      - name: Build ESP-IDF Project
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: "v6.0"
+          target: "esp32c3"
+
+      - name: Package Firmware Binaries
+        run: |
+          mkdir firmware_binaries
+
+          # Copy binaries to a safe handling folder
+          cp build/bootloader/bootloader.bin firmware_binaries/ 2>/dev/null || true
+          cp build/partition_table/partition-table.bin firmware_binaries/ 2>/dev/null || true
+          cp build/cirwlib.bin firmware_binaries/ 2>/dev/null || true
+          cp build/flasher_args.json firmware_binaries/ 2>/dev/null || true
+
+          # Merge them into a single factory binary
+          esptool.py --chip esp32c3 merge_bin \
+            -o cirwlib-firmware-${{ github.event.release.tag_name }}.bin \
+            --flash_mode dio \
+            --flash_size 4MB \
+            0x0 firmware_binaries/bootloader.bin \
+            0x8000 firmware_binaries/partition-table.bin \
+            0x10000 firmware_binaries/cirwlib.bin
+
+      - name: Upload Binaries to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: cirwlib-firmware-${{ github.event.release.tag_name }}.bin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
