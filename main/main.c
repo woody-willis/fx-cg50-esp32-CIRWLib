@@ -13,6 +13,11 @@
 #include "handlers/http.h"
 #include "handlers/ai.h"
 
+#define MAX_PACKET_SIZE 256
+
+#define UART_TASK_STACK_SIZE 8192
+#define UART_TASK_PRIORITY   5
+
 static const char *TAG = "MAIN";
 
 static void init_uart() {
@@ -24,42 +29,59 @@ static void init_uart() {
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
-    uart_driver_install(UART_PORT_NUM, UART_RX_BUF_SIZE, UART_TX_BUF_SIZE, 0, NULL, 0);
     uart_param_config(UART_PORT_NUM, &uart_config);
     uart_set_pin(UART_PORT_NUM, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    uart_driver_install(UART_PORT_NUM, UART_RX_BUF_SIZE, UART_TX_BUF_SIZE, 0, NULL, 0);
 
     gpio_pullup_en(UART_RX_PIN);
 }
 
 // Packages and sends a response back to the calculator using the TLV spec
-void send_packet(uint8_t cmd, const uint8_t *payload, uint16_t len) {
-    uint8_t header[4];
-    header[0] = PROTOCOL_SYNC_BYTE;
-    header[1] = cmd;
-    header[2] = (len >> 8) & 0xFF;
-    header[3] = len & 0xFF;
-
-    uint8_t checksum = header[1] ^ header[2] ^ header[3];
-    for (uint16_t i = 0; i < len; i++) {
-        checksum ^= payload[i];
+void uart_send_packet(uint8_t cmd, const uint8_t *payload, uint16_t len) {
+    if (len > 0 && payload == NULL) {
+        ESP_LOGE(TAG, "Payload is NULL but len > 0");
+        return;
     }
 
-    uart_write_bytes(UART_PORT_NUM, header, 4);
-    if (len > 0 && payload != NULL) {
-        uart_write_bytes(UART_PORT_NUM, payload, len);
+    if (len + 5 > MAX_PACKET_SIZE) {
+        ESP_LOGE(TAG, "Payload too large: %d bytes", len);
+        return;
     }
-    uart_write_bytes(UART_PORT_NUM, &checksum, 1);
+
+    uint8_t packet[MAX_PACKET_SIZE];
+
+    packet[0] = PROTOCOL_SYNC_BYTE;
+    packet[1] = cmd;
+    packet[2] = (uint8_t)((len >> 8) & 0xFF);
+    packet[3] = (uint8_t)(len & 0xFF);
+
+    uint8_t checksum = packet[1] ^ packet[2] ^ packet[3];
+
+    if (len > 0) {
+        for (uint16_t i = 0; i < len; i++) {
+            packet[4 + i] = payload[i];
+            checksum ^= payload[i];
+        }
+    }
+
+    packet[4 + len] = checksum;
+    ESP_LOGI(TAG, "send_packet: cmd=0x%02X len=%d", cmd, len);
+    ESP_LOG_BUFFER_HEX(TAG, packet, len + 5);
+    uart_write_bytes(UART_PORT_NUM, packet, len + 5);
 }
 
 // Router to dispatch incoming binary payloads and collect string responses
-void process_packet(uint8_t cmd, uint8_t *payload, uint16_t len) {
+void uart_process_packet(uint8_t cmd, uint8_t *payload, uint16_t len) {
     char *response = NULL;
 
     ESP_LOGI(TAG, "Processing Command ID: 0x%02X, Length: %d", cmd, len);
 
     switch (cmd) {
         case CMD_PING:
-            response = strdup("PONG");
+            response = malloc(1);
+            if (response) {
+                response[0] = 0x00; // Indicate success for ping
+            }
             break;
         case CMD_WIFI_SCAN:
         case CMD_WIFI_STATUS:
@@ -74,24 +96,22 @@ void process_packet(uint8_t cmd, uint8_t *payload, uint16_t len) {
             response = handle_ai_command((char*)payload, len);
             break;
         default:
-            response = strdup("ERROR_UNKNOWN_COMMAND");
+            response = malloc(1);
+            if (response) {
+                response[0] = 0xFF; // Indicate unknown command
+            }
             break;
     }
 
     if (response) {
-        send_packet(cmd, (uint8_t*)response, strlen(response));
+        uart_send_packet(cmd, (uint8_t*)response, strlen(response));
         free(response);
     } else {
-        send_packet(cmd, (uint8_t*)"OK", 2);
+        uart_send_packet(cmd, (uint8_t*)"OK", 2);
     }
 }
 
-void app_main(void) {
-    ESP_LOGI(TAG, "Initializing System...");
-    wifi_init();
-    init_uart();
-    ESP_LOGI(TAG, "System Initialized. Waiting for UART commands.");
-
+static void uart_command_task(void *pvParameters) {
     // FSM State Variables
     rx_state_t state = STATE_WAIT_SYNC;
     uint8_t cmd = 0;
@@ -167,7 +187,7 @@ void app_main(void) {
 
                     case STATE_READ_CHECKSUM:
                         if (checksum == b) {
-                            process_packet(cmd, payload, packet_len);
+                            uart_process_packet(cmd, payload, packet_len);
                         } else {
                             ESP_LOGE(TAG, "Checksum mismatch! Calc: 0x%02X, Recv: 0x%02X", checksum, b);
                         }
@@ -191,5 +211,27 @@ void app_main(void) {
                 state = STATE_WAIT_SYNC;
             }
         }
+    }
+
+    vTaskDelete(NULL);
+}
+
+void app_main(void) {
+    ESP_LOGI(TAG, "Initializing System...");
+    wifi_init();
+    init_uart();
+    ESP_LOGI(TAG, "System Initialized. Waiting for UART commands.");
+
+    BaseType_t task_created = xTaskCreate(
+        uart_command_task,
+        "uart_cmd_task",
+        UART_TASK_STACK_SIZE,
+        NULL,
+        UART_TASK_PRIORITY,
+        NULL
+    );
+
+    if (task_created != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create uart_command_task");
     }
 }
