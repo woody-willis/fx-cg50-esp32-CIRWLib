@@ -7,7 +7,7 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 
-#include "config.h"
+#include "handlers/config_handler.h"
 #include "protocol.h"
 #include "handlers/wifi.h"
 #include "handlers/http.h"
@@ -22,18 +22,18 @@ static const char *TAG = "MAIN";
 
 static void init_uart() {
     uart_config_t uart_config = {
-        .baud_rate = UART_BAUD_RATE,
+        .baud_rate = get_config_int(CONFIG_KEY_UART_BAUD_RATE),
         .data_bits = UART_DATA_8_BITS,
         .parity    = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_2,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
-    uart_param_config(UART_PORT_NUM, &uart_config);
-    uart_set_pin(UART_PORT_NUM, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    uart_driver_install(UART_PORT_NUM, UART_RX_BUF_SIZE, UART_TX_BUF_SIZE, 0, NULL, 0);
+    uart_param_config(get_config_int(CONFIG_KEY_UART_PORT_NUM), &uart_config);
+    uart_set_pin(get_config_int(CONFIG_KEY_UART_PORT_NUM), get_config_int(CONFIG_KEY_UART_TX_PIN), get_config_int(CONFIG_KEY_UART_RX_PIN), UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    uart_driver_install(get_config_int(CONFIG_KEY_UART_PORT_NUM), get_config_int(CONFIG_KEY_UART_RX_BUF_SIZE), get_config_int(CONFIG_KEY_UART_TX_BUF_SIZE), 0, NULL, 0);
 
-    gpio_pullup_en(UART_RX_PIN);
+    gpio_pullup_en(get_config_int(CONFIG_KEY_UART_RX_PIN));
 }
 
 // Packages and sends a response back to the calculator using the TLV spec
@@ -67,47 +67,46 @@ void uart_send_packet(uint8_t cmd, const uint8_t *payload, uint16_t len) {
     packet[4 + len] = checksum;
     ESP_LOGI(TAG, "send_packet: cmd=0x%02X len=%d", cmd, len);
     ESP_LOG_BUFFER_HEX(TAG, packet, len + 5);
-    uart_write_bytes(UART_PORT_NUM, packet, len + 5);
+    uart_write_bytes(get_config_int(CONFIG_KEY_UART_PORT_NUM), packet, len + 5);
 }
 
-// Router to dispatch incoming binary payloads and collect string responses
+// Router to dispatch incoming binary payloads and collect raw byte responses
 void uart_process_packet(uint8_t cmd, uint8_t *payload, uint16_t len) {
-    char *response = NULL;
+    response_t response = { .data = NULL, .len = 0 };
 
     ESP_LOGI(TAG, "Processing Command ID: 0x%02X, Length: %d", cmd, len);
 
     switch (cmd) {
         case CMD_PING:
-            response = malloc(1);
-            if (response) {
-                response[0] = 0x00; // Indicate success for ping
-            }
+            response = response_status(RESP_OK);
             break;
         case CMD_WIFI_SCAN:
         case CMD_WIFI_STATUS:
         case CMD_WIFI_CONNECT:
-            response = handle_wifi_command(cmd, (char*)payload, len);
+            response = handle_wifi_command(cmd, payload, len);
             break;
         case CMD_HTTP_GET:
         case CMD_HTTP_POST:
-            response = handle_http_command(cmd, (char*)payload, len);
+            response = handle_http_command(cmd, payload, len);
             break;
         case CMD_AI_QUERY:
-            response = handle_ai_command((char*)payload, len);
+            response = handle_ai_command(payload, len);
+            break;
+        case CMD_CONFIG_GET:
+        case CMD_CONFIG_SET:
+            response = handle_config_command(cmd, payload, len);
             break;
         default:
-            response = malloc(1);
-            if (response) {
-                response[0] = 0xFF; // Indicate unknown command
-            }
+            response = response_status(RESP_ERROR_UNKNOWN_COMMAND);
             break;
     }
 
-    if (response) {
-        uart_send_packet(cmd, (uint8_t*)response, strlen(response));
-        free(response);
+    if (response.data) {
+        uart_send_packet(cmd, response.data, response.len);
+        free(response.data);
     } else {
-        uart_send_packet(cmd, (uint8_t*)"OK", 2);
+        // No data produced; send a bare OK status byte
+        uart_send_packet(cmd, (uint8_t*)&(uint8_t){RESP_OK}, 1);
     }
 }
 
@@ -124,7 +123,7 @@ static void uart_command_task(void *pvParameters) {
     uint8_t rx_buf[128];
 
     while (1) {
-        int bytes_read = uart_read_bytes(UART_PORT_NUM, rx_buf, sizeof(rx_buf), pdMS_TO_TICKS(10));
+        int bytes_read = uart_read_bytes(get_config_int(CONFIG_KEY_UART_PORT_NUM), rx_buf, sizeof(rx_buf), pdMS_TO_TICKS(10));
 
         if (bytes_read > 0) {
             last_rx_time = xTaskGetTickCount();
@@ -218,6 +217,7 @@ static void uart_command_task(void *pvParameters) {
 
 void app_main(void) {
     ESP_LOGI(TAG, "Initializing System...");
+    config_init();
     wifi_init();
     init_uart();
     ESP_LOGI(TAG, "System Initialized. Waiting for UART commands.");

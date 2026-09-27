@@ -1,14 +1,22 @@
 #include "ai.h"
 #include "http.h"
-#include "config.h"
+#include "config_handler.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include "cJSON.h"
 
-static char* query_openai(const char *query) {
+static response_t query_openai(const char *query) {
+    char *api_key = get_config_string(CONFIG_KEY_OPENAI_API_KEY);
+    char *api_url = get_config_string(CONFIG_KEY_OPENAI_API_URL);
+    if (!api_key || !api_url) {
+        free(api_key);
+        free(api_url);
+        return response_status(RESP_ERROR_AI_REQUEST_FAILED);
+    }
+
     char auth_header[256];
-    snprintf(auth_header, sizeof(auth_header), "Bearer %s", OPENAI_API_KEY);
+    snprintf(auth_header, sizeof(auth_header), "Bearer %s", api_key);
 
     const char *headers[][2] = {
         {"Authorization", auth_header},
@@ -34,38 +42,45 @@ static char* query_openai(const char *query) {
     cJSON_Delete(root);
 
     char url[256];
-    snprintf(url, sizeof(url), "%s/chat/completions", OPENAI_API_URL);
+    snprintf(url, sizeof(url), "%s/chat/completions", api_url);
 
-    char *raw_response = perform_http_request(url, "POST", post_data, headers, 2);
+    uint16_t raw_len = 0;
+    uint8_t *raw_response = perform_http_request(url, "POST", post_data, headers, 2, &raw_len);
     free(post_data);
+    free(api_key);
+    free(api_url);
 
-    if (!raw_response) return strdup("ERROR+AI_REQUEST_FAILED");
+    if (!raw_response) return response_status(RESP_ERROR_AI_REQUEST_FAILED);
 
-    // Parse JSON response
-    cJSON *resp_json = cJSON_Parse(raw_response);
+    // Parse JSON response (raw body is null-terminated by the HTTP buffer)
+    cJSON *resp_json = cJSON_Parse((const char*)raw_response);
     free(raw_response);
     
-    if (!resp_json) return strdup("ERROR+AI_RESPONSE_PARSE_FAILED");
+    if (!resp_json) return response_status(RESP_ERROR_AI_PARSE_FAILED);
 
     cJSON *choices = cJSON_GetObjectItem(resp_json, "choices");
     cJSON *choice = cJSON_GetArrayItem(choices, 0);
     cJSON *message = cJSON_GetObjectItem(choice, "message");
     cJSON *content = cJSON_GetObjectItem(message, "content");
 
-    char *final_response;
+    response_t r;
     if (cJSON_IsString(content) && content->valuestring != NULL) {
-        final_response = strdup(content->valuestring);
+        size_t clen = strlen(content->valuestring);
+        uint8_t *buf = malloc(clen);
+        if (buf) memcpy(buf, content->valuestring, clen);
+        r.data = buf;
+        r.len = (uint16_t)clen;
     } else {
-        final_response = strdup("ERROR+AI_RESPONSE_PARSE_FAILED");
+        r = response_status(RESP_ERROR_AI_PARSE_FAILED);
     }
 
     cJSON_Delete(resp_json);
-    return final_response;
+    return r;
 }
 
-char* handle_ai_command(char *payload, uint16_t len) {
+response_t handle_ai_command(uint8_t *payload, uint16_t len) {
     if (!payload || len == 0) {
-        return strdup("ERROR_INVALID_PARAMS");
+        return response_status(RESP_ERROR_INVALID_PARAMS);
     }
-    return query_openai(payload);
+    return query_openai((const char*)payload);
 }

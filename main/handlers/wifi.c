@@ -1,5 +1,5 @@
 #include "wifi.h"
-#include "config.h"
+#include "config_handler.h"
 #include "protocol.h"
 #include <string.h>
 #include <stdlib.h>
@@ -57,7 +57,10 @@ static void sync_time(void) {
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        if (strlen(NETWORK_SSID) > 0) {
+        char *ssid = get_config_string(CONFIG_KEY_NETWORK_SSID);
+        int has_ssid = (ssid != NULL && strlen(ssid) > 0);
+        free(ssid);
+        if (has_ssid) {
             current_wifi_status = W_CONNECTING;
             esp_wifi_connect();
         }
@@ -95,16 +98,22 @@ void wifi_init(void) {
     esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL);
 
     wifi_config_t wifi_config = { .sta = { .threshold = { .authmode = WIFI_AUTH_WPA2_PSK } } };
-    if (strlen(NETWORK_SSID) > 0) {
-        strcpy((char*)wifi_config.sta.ssid, NETWORK_SSID);
-        strcpy((char*)wifi_config.sta.password, NETWORK_PASSWORD);
+    char *ssid = get_config_string(CONFIG_KEY_NETWORK_SSID);
+    char *password = get_config_string(CONFIG_KEY_NETWORK_PASSWORD);
+    if (ssid && strlen(ssid) > 0) {
+        strncpy((char*)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid) - 1);
+        if (password) {
+            strncpy((char*)wifi_config.sta.password, password, sizeof(wifi_config.sta.password) - 1);
+        }
     }
+    free(ssid);
+    free(password);
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
     esp_wifi_start();
 }
 
-char* handle_wifi_command(uint8_t cmd, char *payload, uint16_t len) {
+response_t handle_wifi_command(uint8_t cmd, uint8_t *payload, uint16_t len) {
     if (cmd == CMD_WIFI_SCAN) {
         esp_wifi_scan_start(NULL, true);
         uint16_t ap_count = 0;
@@ -113,45 +122,72 @@ char* handle_wifi_command(uint8_t cmd, char *payload, uint16_t len) {
         wifi_ap_record_t *ap_records = malloc(max_aps * sizeof(wifi_ap_record_t));
         esp_wifi_scan_get_ap_records(&max_aps, ap_records);
 
-        char *response = malloc(512);
-        int offset = snprintf(response, 512, "SCAN_RESULT:%d;", max_aps);
+        // Raw format: [status][count] then per-AP: ssid\0, rssi(int8), authmode(uint8)
+        size_t cap = 2;
         for (int i = 0; i < max_aps; i++) {
-            offset += snprintf(response + offset, 512 - offset, "%.32s,%d,%d;",
-                               ap_records[i].ssid, ap_records[i].rssi, ap_records[i].authmode);
+            cap += strlen((const char*)ap_records[i].ssid) + 1 + 2;
+        }
+        uint8_t *buf = malloc(cap);
+        size_t off = 0;
+        buf[off++] = RESP_OK;
+        buf[off++] = (uint8_t)max_aps;
+        for (int i = 0; i < max_aps; i++) {
+            size_t slen = strlen((const char*)ap_records[i].ssid);
+            memcpy(buf + off, ap_records[i].ssid, slen);
+            off += slen;
+            buf[off++] = '\0';
+            buf[off++] = (uint8_t)ap_records[i].rssi;
+            buf[off++] = (uint8_t)ap_records[i].authmode;
         }
         free(ap_records);
-        return response;
+
+        response_t r = { .data = buf, .len = (uint16_t)off };
+        return r;
     }
 
     if (cmd == CMD_WIFI_STATUS) {
-        if (current_wifi_status == W_IDLE) return strdup("STATUS:IDLE");
-        if (current_wifi_status == W_CONNECTING) return strdup("STATUS:CONNECTING");
-        if (current_wifi_status == W_WRONG_PASSWORD) return strdup("STATUS:WRONG_PASSWORD");
-        if (current_wifi_status == W_NO_AP_FOUND) return strdup("STATUS:NO_AP_FOUND");
-        if (current_wifi_status == W_CONNECT_FAIL) return strdup("STATUS:CONNECT_FAIL");
         if (current_wifi_status == W_CONNECTED) {
             wifi_config_t cfg;
             esp_wifi_get_config(WIFI_IF_STA, &cfg);
             esp_netif_ip_info_t ip_info;
             esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &ip_info);
-            char *response = malloc(128);
-            snprintf(response, 128, "STATUS:CONNECTED,SSID:%s,IP:" IPSTR, cfg.sta.ssid, IP2STR(&ip_info.ip));
-            return response;
+
+            // Raw format: [status][ssid\0][ip(4 bytes)]
+            size_t slen = strlen((const char*)cfg.sta.ssid);
+            uint8_t *buf = malloc(1 + slen + 1 + 4);
+            size_t off = 0;
+            buf[off++] = RESP_OK;
+            memcpy(buf + off, cfg.sta.ssid, slen);
+            off += slen;
+            buf[off++] = '\0';
+            memcpy(buf + off, &ip_info.ip.addr, 4);
+            off += 4;
+
+            response_t r = { .data = buf, .len = (uint16_t)off };
+            return r;
         }
-        return strdup("STATUS:UNKNOWN");
+
+        switch (current_wifi_status) {
+            case W_IDLE:            return response_status(RESP_WIFI_IDLE);
+            case W_CONNECTING:      return response_status(RESP_WIFI_CONNECTING);
+            case W_WRONG_PASSWORD:  return response_status(RESP_ERROR_AUTH_FAILED);
+            case W_NO_AP_FOUND:     return response_status(RESP_ERROR_AP_NOT_FOUND);
+            case W_CONNECT_FAIL:    return response_status(RESP_ERROR_CONNECT_FAILED);
+            default:                return response_status(RESP_ERROR_UNKNOWN_COMMAND);
+        }
     }
 
     if (cmd == CMD_WIFI_CONNECT) {
-        if (!payload || len == 0) return strdup("ERROR_INVALID_PARAMS");
+        if (!payload || len == 0) return response_status(RESP_ERROR_INVALID_PARAMS);
 
-        char *ssid = payload;
-        size_t ssid_len = strlen(ssid);
-        // Ensure that there is data remaining for the password after the \0 separator
-        if (ssid_len + 1 >= len) return strdup("ERROR_INVALID_PARAMS");
-        char *password = payload + ssid_len + 1;
+        // Payload: ssid\0password (raw bytes, no strlen on the whole buffer)
+        uint8_t *sep = memchr(payload, '\0', len);
+        if (!sep || (size_t)(sep - payload) + 1 >= len) return response_status(RESP_ERROR_INVALID_PARAMS);
+        size_t ssid_len = (size_t)(sep - payload);
+        char *password = (char*)(sep + 1);
 
         wifi_config_t wifi_config = {0};
-        strncpy((char*)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid)-1);
+        memcpy(wifi_config.sta.ssid, payload, ssid_len < sizeof(wifi_config.sta.ssid) ? ssid_len : sizeof(wifi_config.sta.ssid) - 1);
         strncpy((char*)wifi_config.sta.password, password, sizeof(wifi_config.sta.password)-1);
 
         esp_wifi_disconnect();
@@ -163,12 +199,12 @@ char* handle_wifi_command(uint8_t cmd, char *payload, uint16_t len) {
         EventBits_t bits = xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
                                                pdFALSE, pdFALSE, pdMS_TO_TICKS(15000));
 
-        if (bits & WIFI_CONNECTED_BIT) return strdup("OK");
-        if (current_wifi_status == W_NO_AP_FOUND) return strdup("ERROR_AP_NOT_FOUND");
-        if (current_wifi_status == W_WRONG_PASSWORD) return strdup("ERROR_AUTH_FAILED");
-        if (bits & WIFI_FAIL_BIT) return strdup("ERROR_CONNECT_FAILED");
-        return strdup("ERROR_CONNECT_TIMEOUT");
+        if (bits & WIFI_CONNECTED_BIT) return response_status(RESP_OK);
+        if (current_wifi_status == W_NO_AP_FOUND) return response_status(RESP_ERROR_AP_NOT_FOUND);
+        if (current_wifi_status == W_WRONG_PASSWORD) return response_status(RESP_ERROR_AUTH_FAILED);
+        if (bits & WIFI_FAIL_BIT) return response_status(RESP_ERROR_CONNECT_FAILED);
+        return response_status(RESP_ERROR_CONNECT_TIMEOUT);
     }
 
-    return strdup("ERROR_UNKNOWN_COMMAND");
+    return response_status(RESP_ERROR_UNKNOWN_COMMAND);
 }

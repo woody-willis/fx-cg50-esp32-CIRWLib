@@ -2,6 +2,7 @@
 #define CONFIG_HANDLER_H
 
 #include <stdint.h>
+#include "protocol.h"
 #include "driver/uart.h" // Needed for UART_NUM_1
 
 // Configuration Keys
@@ -18,9 +19,9 @@
 
 #define CONFIG_KEY_COUNT              10 // Total number of keys
 
-// Robust Default Values
+// Default Values
 #define DEFAULT_OPENAI_API_KEY        ""
-#define DEFAULT_OPENAI_API_URL        "https://api.openai.com/v1/chat/completions"
+#define DEFAULT_OPENAI_API_URL        "https://generativelanguage.googleapis.com/v1beta/openai"
 #define DEFAULT_NETWORK_SSID          ""
 #define DEFAULT_NETWORK_PASSWORD      ""
 #define DEFAULT_UART_PORT_NUM         UART_NUM_1
@@ -32,8 +33,12 @@
 
 // Core Functions
 void config_init(void);
-char* get_config_value(const int key);
-char* set_config_value(const int key, const char *value);
-char* handle_config_command(char *payload, uint16_t len);
+uint8_t* get_config_value(const int key, uint16_t *out_len);
+resp_status_t set_config_value(const int key, const uint8_t *value, uint16_t len);
+response_t handle_config_command(uint8_t cmd, uint8_t *payload, uint16_t len);
+
+// Convenience accessors (caller must free the string returned by get_config_string)
+char* get_config_string(const int key);
+int32_t get_config_int(const int key);
 
 #endif // CONFIG_HANDLER_H

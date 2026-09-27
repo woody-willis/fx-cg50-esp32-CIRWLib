@@ -23,7 +23,9 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt) {
     return ESP_OK;
 }
 
-char* perform_http_request(const char *url, const char *method, const char *post_data, const char *headers[][2], int header_count) {
+// Performs an HTTP request and returns the raw response body.
+// Returns NULL on failure. Caller must free the returned buffer.
+uint8_t* perform_http_request(const char *url, const char *method, const char *post_data, const char *headers[][2], int header_count, uint16_t *out_len) {
     http_buffer_t response_buf = { .buffer = calloc(1, 1), .len = 0 };
 
     esp_http_client_config_t config = {
@@ -51,32 +53,40 @@ char* perform_http_request(const char *url, const char *method, const char *post
     esp_http_client_cleanup(client);
 
     if (err == ESP_OK && response_buf.len > 0) {
-        return response_buf.buffer; // Caller must free
+        if (out_len) *out_len = (uint16_t)response_buf.len;
+        return (uint8_t*)response_buf.buffer; // Caller must free
     }
     
     free(response_buf.buffer);
     return NULL;
 }
 
-char* handle_http_command(uint8_t cmd, char *payload, uint16_t len) {
+response_t handle_http_command(uint8_t cmd, uint8_t *payload, uint16_t len) {
     if (cmd == CMD_HTTP_GET) {
-        if (!payload || len == 0) return strdup("ERROR_INVALID_PARAMS");
-        char *resp = perform_http_request(payload, "GET", NULL, NULL, 0);
-        return resp ? resp : strdup("ERROR_HTTP_REQUEST_FAILED");
+        if (!payload || len == 0) return response_status(RESP_ERROR_INVALID_PARAMS);
+        // URL is null-terminated by the receiver FSM
+        uint16_t resp_len = 0;
+        uint8_t *resp = perform_http_request((const char*)payload, "GET", NULL, NULL, 0, &resp_len);
+        if (!resp) return response_status(RESP_ERROR_HTTP_FAILED);
+        response_t r = { .data = resp, .len = resp_len };
+        return r;
     }
 
     if (cmd == CMD_HTTP_POST) {
-        if (!payload || len == 0) return strdup("ERROR_INVALID_PARAMS");
+        if (!payload || len == 0) return response_status(RESP_ERROR_INVALID_PARAMS);
         
-        char *url = payload;
-        size_t url_len = strlen(url);
-        // Verify payload extends past the url and \0
-        if (url_len + 1 >= len) return strdup("ERROR_INVALID_PARAMS");
-        char *data = payload + url_len + 1;
+        // Payload: url\0data (raw bytes)
+        uint8_t *sep = memchr(payload, '\0', len);
+        if (!sep || (size_t)(sep - payload) + 1 >= len) return response_status(RESP_ERROR_INVALID_PARAMS);
+        char *url = (char*)payload;
+        char *data = (char*)(sep + 1);
 
-        char *resp = perform_http_request(url, "POST", data, NULL, 0);
-        return resp ? resp : strdup("ERROR_HTTP_REQUEST_FAILED");
+        uint16_t resp_len = 0;
+        uint8_t *resp = perform_http_request(url, "POST", data, NULL, 0, &resp_len);
+        if (!resp) return response_status(RESP_ERROR_HTTP_FAILED);
+        response_t r = { .data = resp, .len = resp_len };
+        return r;
     }
 
-    return strdup("ERROR_UNKNOWN_COMMAND");
+    return response_status(RESP_ERROR_UNKNOWN_COMMAND);
 }
